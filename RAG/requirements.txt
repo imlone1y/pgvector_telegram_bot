@@ -1,0 +1,17 @@
+python-telegram-bot
+python-dotenv
+pytesseract
+torch
+Pillow
+PyMuPDF
+pypdf
+psycopg2-binary
+openai
+langchain==0.2.0
+langchain-community
+langchain-openai
+langchain-text-splitters
+frontend
+streamlit
+tools
+google
