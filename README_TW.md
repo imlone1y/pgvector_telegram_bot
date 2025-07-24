@@ -24,7 +24,20 @@
 
 ## 運行指南
 
-本項目基於 Python 程式語言，使用到外部程式庫皆在 `requirement.txt`。建議使用 [Anaconda](https://www.anaconda.com) 配置 Python 環境。需事先準備 `telegram bot token` 詳細創建 [telegram bot](https://ithelp.ithome.com.tw/m/articles/10235578) 方法。
+本項目基於 Python 程式語言，使用到外部程式庫皆在 `requirement.txt` 中。建議使用 [Anaconda](https://www.anaconda.com) 配置 Python 環境。需事先準備 `telegram bot token` 詳細創建 [telegram bot](https://ithelp.ithome.com.tw/m/articles/10235578) 方法。
 
 以下設定程序已在 `macOS Seqoia v15.5` 系統上測試通過。以下為控制台/終端機（Console/Terminal/Shell）指令。
 
+### 環境配置
+
+填上 `.env` 中所需參數。
+
+```bash
+conda create -n pgvector python=3.13.3
+conda activate
+```
+
+```bash
+cd [該項目目錄]
+pip install -r requirements.txt
+```
