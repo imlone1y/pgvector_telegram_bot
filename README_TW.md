@@ -6,25 +6,29 @@
 
 ## 項目介紹
 
-本項目連接具有 `pgvector` 額外功能之 `PostgreSQL`，與交互界面 `telegram bot`，實現強化檢索生成之功能，並使用 `OpenAIEmbeddings` 作為向量化工具，以及 `gpt-4o` 作為回模型。
+本項目連接具有 `pgvector` 額外功能之 `PostgreSQL`，與交互界面 `Telegram bot`，實現強化檢索生成之功能，並使用 `OpenAIEmbeddings` 作為向量化工具，以及 `gpt-4o` 作為回模型。上傳及管理文件部分為 `image.py`，使用 `Streamlit` 部署。
 
-上傳及管理文件部分為 `image.py`，使用 `streamlit` 部署。
+網頁具有以下功能：
+1. 上傳、刪除文件
+2. 上傳圖片
+3. 將文件中（或圖片檔）的圖片個別註解後向量化
+4. 刪除圖片註解
 
 ## 項目結構
 ```tree
 .
 ├── .env
-├── bot.py
-├── image_dir
-├── image_index.pkl
-├── image.py
-├── requirements.txt
-└── uploaded_files
+├── bot.py            # Telegram bot server
+├── image_dir         # 檔案取下的圖片會儲存於此
+├── image_index.pkl   
+├── image.py          # 文件管理及單一圖片註解網頁
+├── requirements.txt  
+└── uploaded_files    # 上傳的檔案會儲存於此
 ```
 
 ## 運行指南
 
-本項目基於 Python 程式語言，使用到外部程式庫皆在 `requirement.txt` 中。建議使用 [Anaconda](https://www.anaconda.com) 配置 Python 環境。需事先準備 `telegram bot token` 詳細創建 [telegram bot](https://ithelp.ithome.com.tw/m/articles/10235578) 方法。
+本項目基於 Python 程式語言，使用到外部程式庫皆在 `requirement.txt` 中。建議使用 [Anaconda](https://www.anaconda.com) 配置 Python 環境。需事先準備 `Telegram bot token` 詳細創建 [telegram bot](https://ithelp.ithome.com.tw/m/articles/10235578) 方法。
 
 以下設定程序已在 `macOS Seqoia v15.5` 系統上測試通過。以下為控制台/終端機（Console/Terminal/Shell）指令。
 
@@ -44,7 +48,7 @@ pip install -r requirements.txt
 
 ### 運行測試
 
-此項目需開兩個 `terminal` 同時執行，一個為網頁，另一個為 `telegram bot`。
+此項目需開兩個 `terminal` 同時執行，一個為網頁，另一個為 `Telegram bot`。
 ```bash
 # 文件管理網頁
 cd [該項目目錄]
