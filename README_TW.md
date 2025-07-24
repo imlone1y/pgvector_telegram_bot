@@ -6,7 +6,7 @@
 
 ## 項目介紹
 
-本項目連接具有 `pgvector` 額外功能之 `PostgreSQL`，與交互界面 `Telegram bot`，實現強化檢索生成之功能，並使用 `OpenAIEmbeddings` 作為向量化工具，以及 `gpt-4o` 作為回模型。上傳及管理文件部分為 `image.py`，使用 `Streamlit` 部署。
+本項目連接具有 `pgvector` 額外功能之 `PostgreSQL`，與交互界面 `Telegram bot`，實現強化檢索生成之功能，並使用 `OpenAIEmbeddings` 作為向量化工具，以及 `gpt-4o` 作為回模型。上傳及管理文件部分為 `image.py`，使用 `Streamlit` 部署網頁。
 
 網頁具有以下功能：
 1. 上傳、刪除文件
