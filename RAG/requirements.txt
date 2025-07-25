@@ -2,6 +2,7 @@ python-telegram-bot
 python-dotenv
 pytesseract
 torch
+transformers
 Pillow
 PyMuPDF
 pypdf
