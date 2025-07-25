@@ -6,7 +6,12 @@ from PIL import Image
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings
 from transformers import CLIPProcessor, CLIPModel
+import hashlib
+import pytesseract
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+seen_hashes = set()
 load_dotenv()
 
 # 初始化資料夾與模型
@@ -45,97 +50,100 @@ st.header("📤 批量上傳圖片")
 uploaded_images = st.file_uploader("選擇圖片（可複選）", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="img_upload")
 
 for uploaded_file in uploaded_images:
-    save_path = os.path.join(IMAGE_FOLDER, uploaded_file.name)
-    with open(save_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    st.success(f"已儲存圖片：{uploaded_file.name}")
+    with st.spinner(f"🔍 正在處理圖片：{uploaded_file.name}"):
+        save_path = os.path.join(IMAGE_FOLDER, uploaded_file.name)
+        with open(save_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        st.success(f"已儲存圖片：{uploaded_file.name}")
 
-    cur.execute("SELECT 1 FROM documents WHERE image_ref = %s", (uploaded_file.name,))
-    if not cur.fetchone():
-        image = Image.open(save_path)
-        try:
-            import pytesseract
-            text = pytesseract.image_to_string(image, lang="chi_tra+eng").strip()
-            if text:
-                vector = embedding_model.embed_query(text)
-                vector_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
-                cur.execute(
-                    """
-                    INSERT INTO documents (content, embedding, source_type, image_ref, image_desc, filename, page_num)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (text, vector_str, 'uploaded_image', uploaded_file.name, None, uploaded_file.name, None)
-                )
-        except Exception as e:
-            st.error(f"OCR/嵌入失敗：{e}")
-conn.commit()
-
-# 🔼 批量上傳文件
-st.header("📤 批量上傳文件（PDF/TXT）")
-uploaded_docs = st.file_uploader("選擇文件（可複選）", type=["pdf", "txt"], accept_multiple_files=True, key="doc_upload")
-
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-for doc_file in uploaded_docs:
-    doc_path = os.path.join(FILE_FOLDER, doc_file.name)
-    with open(doc_path, "wb") as f:
-        f.write(doc_file.getbuffer())
-    st.success(f"✅ 已儲存文件：{doc_file.name}")
-
-    if doc_file.name.endswith(".pdf"):
-        loader = PyPDFLoader(doc_path)
-    else:
-        loader = TextLoader(doc_path)
-
-    raw_docs = loader.load()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
-    documents = splitter.split_documents(raw_docs)
-
-    for doc in documents:
-        content = doc.page_content.strip()
-        if not content:
-            continue
-        vector = embedding_model.embed_query(content)
-        vector_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
-        cur.execute(
-            """
-            INSERT INTO documents (content, embedding, source_type, filename, page_num)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (content, vector_str, 'pdf_text', doc_file.name, None)
-        )
-
-    # 補充：處理 PDF 圖片 OCR（比照 bot.py）
-    if doc_file.name.endswith(".pdf"):
-        pdf_doc = fitz.open(doc_path)
-        for page_index in range(len(pdf_doc)):
-            images = pdf_doc[page_index].get_images(full=True)
-            for img_index, img_info in enumerate(images):
-                xref = img_info[0]
-                base_image = pdf_doc.extract_image(xref)
-                image_bytes = base_image["image"]
-
-                image_filename = f"{doc_file.name}_page{page_index+1}_img{img_index+1}.png"
-                image_path = os.path.join(IMAGE_FOLDER, image_filename)
-                with open(image_path, "wb") as f:
-                    f.write(image_bytes)
-
-                image = Image.open(image_path)
-                import pytesseract
+        cur.execute("SELECT 1 FROM documents WHERE image_ref = %s", (uploaded_file.name,))
+        if not cur.fetchone():
+            image = Image.open(save_path)
+            try:
                 text = pytesseract.image_to_string(image, lang="chi_tra+eng").strip()
-
                 if text:
                     vector = embedding_model.embed_query(text)
                     vector_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
                     cur.execute(
                         """
-                        INSERT INTO documents (content, embedding, source_type, filename, page_num, image_ref, image_desc)
+                        INSERT INTO documents (content, embedding, source_type, image_ref, image_desc, filename, page_num)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (text, vector_str, 'ocr_image', doc_file.name, page_index+1, image_filename, None)
+                        (text, vector_str, 'uploaded_image', uploaded_file.name, None, uploaded_file.name, None)
                     )
+            except Exception as e:
+                st.error(f"OCR/嵌入失敗：{e}")
 conn.commit()
+
+
+# 🔼 批量上傳文件
+st.header("📤 批量上傳文件（PDF/TXT）")
+uploaded_docs = st.file_uploader("選擇文件（可複選）", type=["pdf", "txt"], accept_multiple_files=True, key="doc_upload")
+
+for doc_file in uploaded_docs:
+    with st.spinner(f"📄 正在處理文件：{doc_file.name}"):
+        doc_path = os.path.join(FILE_FOLDER, doc_file.name)
+        with open(doc_path, "wb") as f:
+            f.write(doc_file.getbuffer())
+        st.success(f"✅ 已儲存文件：{doc_file.name}")
+
+        if doc_file.name.endswith(".pdf"):
+            loader = PyPDFLoader(doc_path)
+        else:
+            loader = TextLoader(doc_path)
+
+        raw_docs = loader.load()
+        splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
+        documents = splitter.split_documents(raw_docs)
+
+        for doc in documents:
+            content = doc.page_content.strip()
+            if not content:
+                continue
+            vector = embedding_model.embed_query(content)
+            vector_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
+            cur.execute(
+                """
+                INSERT INTO documents (content, embedding, source_type, filename, page_num)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (content, vector_str, 'pdf_text', doc_file.name, None)
+            )
+
+        if doc_file.name.endswith(".pdf"):
+            pdf_doc = fitz.open(doc_path)
+            for page_index in range(len(pdf_doc)):
+                images = pdf_doc[page_index].get_images(full=True)
+                for img_index, img_info in enumerate(images):
+                    xref = img_info[0]
+                    base_image = pdf_doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+
+                    img_hash = hashlib.md5(image_bytes).hexdigest()
+                    if img_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(img_hash)
+
+                    image_filename = f"{doc_file.name}_page{page_index+1}_xref{xref}.png"
+                    image_path = os.path.join(IMAGE_FOLDER, image_filename)
+                    with open(image_path, "wb") as f:
+                        f.write(image_bytes)
+
+                    image = Image.open(image_path)
+                    text = pytesseract.image_to_string(image, lang="chi_tra+eng").strip()
+
+                    if text:
+                        vector = embedding_model.embed_query(text)
+                        vector_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
+                        cur.execute(
+                            """
+                            INSERT INTO documents (content, embedding, source_type, filename, page_num, image_ref, image_desc)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (text, vector_str, 'ocr_image', doc_file.name, page_index+1, image_filename, None)
+                        )
+conn.commit()
+
 
 st.header("🗃️ 文件管理與刪除")
 
@@ -225,7 +233,8 @@ if selected_file:
                     os.remove(image_path)
                     cur.execute("DELETE FROM documents WHERE image_ref = %s", (image_ref,))
                     conn.commit()
-                    st.warning(f"❌ 已刪除圖片 {image_ref} 與其向量紀錄，請重新整理")
+                    st.warning(f"❌ 已刪除圖片 {image_ref} 與其向量紀錄")
+                    st.experimental_rerun()
                 except Exception as e:
                     st.error(f"刪除失敗：{e}")
     
