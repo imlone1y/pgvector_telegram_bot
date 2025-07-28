@@ -234,7 +234,7 @@ if selected_file:
                     cur.execute("DELETE FROM documents WHERE image_ref = %s", (image_ref,))
                     conn.commit()
                     st.warning(f"❌ 已刪除圖片 {image_ref} 與其向量紀錄")
-                    st.experimental_rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"刪除失敗：{e}")
     
