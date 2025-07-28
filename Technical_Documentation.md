@@ -1,6 +1,6 @@
 # Rag + pgvector + Telegram Bot Technical Documentation
 
-[繁體中文](Technical Documentation_TW.md) | English
+[繁體中文](Technical_Documentation_TW.md) | English
 
 ## 1. Feature Overview
 
