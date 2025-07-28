@@ -201,42 +201,46 @@ if selected_file:
 
     rows = cur.fetchall()
 
-    for image_ref, image_desc, page_num in rows:
-        image_path = os.path.join(IMAGE_FOLDER, image_ref)
-        if not os.path.exists(image_path):
-            continue
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col1:
-            st.image(image_path, width=200, caption=f"頁碼 {page_num}" if page_num else None)
-        with col2:
-            st.markdown(f"**檔名：** `{image_ref}`")
-            new_desc = st.text_input(f"輸入描述", value=image_desc or "", key=f"desc_{image_ref}")
-            if st.button(f"💾 儲存註解 - {image_ref}", key=f"save_{image_ref}"):
-                clean_desc = new_desc.strip()
-                cur.execute("UPDATE documents SET image_desc = %s WHERE image_ref = %s", 
-                            (clean_desc if clean_desc else None, image_ref))
+for idx, (image_ref, image_desc, page_num) in enumerate(rows):
+    image_path = os.path.join(IMAGE_FOLDER, image_ref)
+    if not os.path.exists(image_path):
+        continue
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        st.image(image_path, width=200, caption=f"頁碼 {page_num}" if page_num else None)
+    with col2:
+        st.markdown(f"**檔名：** {image_ref}")
+        new_desc = st.text_input(
+            f"輸入描述", 
+            value=image_desc or "", 
+            key=f"desc_{image_ref}_{idx}"
+        )
+        if st.button(f"💾 儲存註解 - {image_ref}", key=f"save_{image_ref}_{idx}"):
+            clean_desc = new_desc.strip()
+            cur.execute("UPDATE documents SET image_desc = %s WHERE image_ref = %s", 
+                        (clean_desc if clean_desc else None, image_ref))
 
-                if clean_desc and clean_desc != (image_desc or ""):
-                    # 有新註解 → 生成向量
-                    vector = embedding_model.embed_query(clean_desc)
-                    vector_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
-                    cur.execute("UPDATE documents SET embedding = %s WHERE image_ref = %s", (vector_str, image_ref))
-                elif not clean_desc:
-                    # 沒有註解 → 把向量設為 NULL（防止被查到）
-                    cur.execute("UPDATE documents SET embedding = NULL WHERE image_ref = %s", (image_ref,))
-                
+            if clean_desc and clean_desc != (image_desc or ""):
+                # 有新註解 → 生成向量
+                vector = embedding_model.embed_query(clean_desc)
+                vector_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
+                cur.execute("UPDATE documents SET embedding = %s WHERE image_ref = %s", (vector_str, image_ref))
+            elif not clean_desc:
+                # 沒有註解 → 把向量設為 NULL
+                cur.execute("UPDATE documents SET embedding = NULL WHERE image_ref = %s", (image_ref,))
+            
+            conn.commit()
+            st.success(f"✅ 已更新 {image_ref} 的註解與向量")
+    with col3:
+        if st.button(f"🗑 刪除圖片 - {image_ref}", key=f"delete_{image_ref}_{idx}"):
+            try:
+                os.remove(image_path)
+                cur.execute("DELETE FROM documents WHERE image_ref = %s", (image_ref,))
                 conn.commit()
-                st.success(f"✅ 已更新 {image_ref} 的註解與向量")
-        with col3:
-            if st.button(f"🗑 刪除圖片 - {image_ref}", key=f"delete_{image_ref}"):
-                try:
-                    os.remove(image_path)
-                    cur.execute("DELETE FROM documents WHERE image_ref = %s", (image_ref,))
-                    conn.commit()
-                    st.warning(f"❌ 已刪除圖片 {image_ref} 與其向量紀錄")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"刪除失敗：{e}")
+                st.warning(f"❌ 已刪除圖片 {image_ref} 與其向量紀錄")
+                st.rerun()
+            except Exception as e:
+                st.error(f"刪除失敗：{e}")
     
 cur.close()
 conn.close()
