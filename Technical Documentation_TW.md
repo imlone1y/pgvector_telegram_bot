@@ -1,5 +1,7 @@
 # Rag + pgvector + Telegram bot 技術文檔
 
+繁體中文 | [English](Technical_Documentation.md)
+
 ## 一、功能一覽
 
 ### 1. 網頁部分
