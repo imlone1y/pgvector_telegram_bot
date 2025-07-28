@@ -48,6 +48,8 @@ Once modified successfully, the agent will confirm by replying with the updated 
 
 > Example modification process shown in illustration.
 
+<img width="654" height="287" alt="470206446-5d82645b-4a1a-4bb4-b1a2-5a964885ffba" src="https://github.com/user-attachments/assets/20e18a1d-a73a-401a-97e9-56c8ad75f690" />
+
 ---
 
 ## 3. Database Information
@@ -83,7 +85,7 @@ Once modified successfully, the agent will confirm by replying with the updated 
 
 To migrate the database to a new environment, use PostgreSQL’s backup and restore tools as follows:
 
-#### ✅ Method 1: Full Export & Import Using `pg_dump` + `psql`
+#### Method 1: Full Export & Import Using `pg_dump` + `psql`
 
 ```bash
 # Export the entire database (structure + data)
@@ -96,7 +98,7 @@ scp backup.sql user@[new_host_ip]:/path/to/destination
 psql -U [username] -h [new_host] -d [db_name] < backup.sql
 ````
 
-#### ✅ Method 2: Export Only Specific Tables
+#### Method 2: Export Only Specific Tables
 
 ```bash
 # Export only documents and upload_files tables
@@ -106,7 +108,7 @@ pg_dump -U [username] -h [old_host] -t documents -t upload_files -d [db_name] > 
 psql -U [username] -h [new_host] -d [db_name] < partial_backup.sql
 ```
 
-#### ✅ Notes
+#### Notes
 
 * If using `pgvector`, make sure the extension is installed in the new environment:
 
