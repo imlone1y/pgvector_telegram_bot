@@ -61,7 +61,7 @@ for up in imgs:
             continue
 
         # ❷ 生成唯一 image_ref，防止覆蓋
-        image_ref = f"{uuid.uuid4().hex}_{up.name}"
+        unique_ref = f"{uuid.uuid4().hex}_{up.name}"
         save_path  = os.path.join(IMAGE_FOLDER, unique_ref)
         with open(save_path, "wb") as f:
             f.write(raw)
@@ -157,7 +157,8 @@ for df in docs:
 st.header("🗃️ 文件管理與刪除")
 
 # 查詢所有出現在資料庫的檔案名稱
-cur.execute("SELECT DISTINCT filename FROM documents WHERE filename IS NOT NULL")
+cur.execute("""SELECT DISTINCT filename FROM documents WHERE filename IS NOT NULL AND source_type IN ('pdf_text', 'ocr_image')
+""")
 doc_files = sorted([row[0] for row in cur.fetchall() if row[0]])
 
 if doc_files:
@@ -241,7 +242,7 @@ if file_sel:
                     cur.execute("DELETE FROM documents WHERE image_ref=%s", (ir,))
                     conn.commit()
                     st.warning("已刪除")
-                    st.experimental_rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"刪除失敗：{e}")
 
