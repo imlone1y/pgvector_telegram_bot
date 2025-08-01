@@ -1,5 +1,5 @@
 import streamlit as st
-import psycopg2
+import psycopg2, os, uuid, datetime, hashlib
 import os
 import fitz  # 用於 PDF 圖片提取
 from PIL import Image
@@ -61,7 +61,7 @@ for up in imgs:
             continue
 
         # ❷ 生成唯一 image_ref，防止覆蓋
-        unique_ref = f"{uuid.uuid4().hex}_{up.name}"
+        image_ref = f"{uuid.uuid4().hex}_{up.name}"
         save_path  = os.path.join(IMAGE_FOLDER, unique_ref)
         with open(save_path, "wb") as f:
             f.write(raw)
