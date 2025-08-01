@@ -66,6 +66,8 @@
 | image_ref    | text           | 圖片檔案名稱（實體圖片檔名）     |
 | image_desc   | text           | 手動輸入的圖片描述               |
 | source_type  | text           | 來源類型（如 `ocr_image`、`uploaded_image`、`pdf_text`） |
+| image_hash   | varchar        | 圖片內容的 MD5 雜湊，用於檢查是否重複上傳相同圖片 |
+| upload_time  | timestamp      | 實際資料寫入的時間（精確記錄每筆上傳時間，非預設欄位） |
 
 #### Table: `upload_files`
 
