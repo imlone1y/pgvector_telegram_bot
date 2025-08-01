@@ -45,104 +45,113 @@ cur = conn.cursor()
 st.set_page_config(page_title="向量資料管理系統", layout="wide")
 st.title("📁 向量資料管理系統")
 
-# 🔼 批量上傳圖片
+# 批量上傳圖片
 st.header("📤 批量上傳圖片")
-uploaded_images = st.file_uploader("選擇圖片（可複選）", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="img_upload")
+imgs = st.file_uploader("選擇圖片（可複選）", type=["png", "jpg", "jpeg"],
+                        accept_multiple_files=True, key="img_upload")
 
-for uploaded_file in uploaded_images:
-    with st.spinner(f"🔍 正在處理圖片：{uploaded_file.name}"):
-        save_path = os.path.join(IMAGE_FOLDER, uploaded_file.name)
+for up in imgs:
+    with st.spinner(f"處理圖片：{up.name}"):
+        # ❶ 先算 hash，若重複內容直接略過
+        raw      = up.getbuffer()
+        img_hash = hashlib.md5(raw).hexdigest()
+        cur.execute("SELECT 1 FROM documents WHERE image_hash=%s", (img_hash,))
+        if cur.fetchone():
+            st.info(f"⚠️ {up.name} 已存在（內容相同），跳過")
+            continue
+
+        # ❷ 生成唯一 image_ref，防止覆蓋
+        unique_ref = f"{uuid.uuid4().hex}_{up.name}"
+        save_path  = os.path.join(IMAGE_FOLDER, unique_ref)
         with open(save_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        st.success(f"已儲存圖片：{uploaded_file.name}")
+            f.write(raw)
 
-        cur.execute("SELECT 1 FROM documents WHERE image_ref = %s", (uploaded_file.name,))
-        if not cur.fetchone():
-            image = Image.open(save_path)
-            try:
-                text = pytesseract.image_to_string(image, lang="chi_tra+eng").strip()
-                if text:
-                    vector = embedding_model.embed_query(text)
-                    vector_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
-                    cur.execute(
-                        """
-                        INSERT INTO documents (content, embedding, source_type, image_ref, image_desc, filename, page_num)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (text, vector_str, 'uploaded_image', uploaded_file.name, None, uploaded_file.name, None)
-                    )
-            except Exception as e:
-                st.error(f"OCR/嵌入失敗：{e}")
-conn.commit()
+        # ❸ OCR（可失敗）
+        try:
+            text = pytesseract.image_to_string(Image.open(save_path),
+                                               lang="chi_tra+eng").strip()
+        except Exception as e:
+            st.error(f"OCR 失敗：{e}")
+            text = ""
+
+        vector_str = None
+        if text:
+            vec        = embedding_model.embed_query(text)
+            vector_str = "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
+
+        # ❹ 寫入資料庫（沒文字也寫，方便後續補註解）
+        cur.execute("""
+            INSERT INTO documents (content, embedding, source_type,
+                                   image_ref, filename, image_desc,
+                                   image_hash, upload_time, page_num)
+            VALUES (%s,%s,'uploaded_image',%s,%s,NULL,%s,%s,NULL)
+        """, (text or None, vector_str, unique_ref, up.name,
+              img_hash, datetime.datetime.utcnow()))
+        conn.commit()
+        st.success(f"✅ 已上傳 {up.name}")
 
 
 # 🔼 批量上傳文件
 st.header("📤 批量上傳文件（PDF/TXT）")
-uploaded_docs = st.file_uploader("選擇文件（可複選）", type=["pdf", "txt"], accept_multiple_files=True, key="doc_upload")
+docs = st.file_uploader("選擇文件（可複選）", type=["pdf", "txt"],
+                        accept_multiple_files=True, key="doc_upload")
 
-for doc_file in uploaded_docs:
-    with st.spinner(f"📄 正在處理文件：{doc_file.name}"):
-        doc_path = os.path.join(FILE_FOLDER, doc_file.name)
+for df in docs:
+    with st.spinner(f"處理文件：{df.name}"):
+        doc_path = os.path.join(FILE_FOLDER, df.name)
         with open(doc_path, "wb") as f:
-            f.write(doc_file.getbuffer())
-        st.success(f"✅ 已儲存文件：{doc_file.name}")
+            f.write(df.getbuffer())
 
-        if doc_file.name.endswith(".pdf"):
-            loader = PyPDFLoader(doc_path)
-        else:
-            loader = TextLoader(doc_path)
-
+        loader = PyPDFLoader(doc_path) if df.name.endswith(".pdf") else TextLoader(doc_path)
         raw_docs = loader.load()
         splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
-        documents = splitter.split_documents(raw_docs)
 
-        for doc in documents:
+        # 文字分段入庫
+        for doc in splitter.split_documents(raw_docs):
             content = doc.page_content.strip()
             if not content:
                 continue
-            vector = embedding_model.embed_query(content)
-            vector_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
-            cur.execute(
-                """
-                INSERT INTO documents (content, embedding, source_type, filename, page_num)
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (content, vector_str, 'pdf_text', doc_file.name, None)
-            )
+            vec = embedding_model.embed_query(content)
+            vec_str = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+            cur.execute("""
+                INSERT INTO documents (content, embedding, source_type,
+                                       filename, page_num)
+                VALUES (%s,%s,'pdf_text',%s,NULL)
+            """, (content, vec_str, df.name))
 
-        if doc_file.name.endswith(".pdf"):
+        # --- 抽 PDF 圖片並入庫 --------------------------------------------
+        if df.name.endswith(".pdf"):
             pdf_doc = fitz.open(doc_path)
-            for page_index in range(len(pdf_doc)):
-                images = pdf_doc[page_index].get_images(full=True)
-                for img_index, img_info in enumerate(images):
-                    xref = img_info[0]
-                    base_image = pdf_doc.extract_image(xref)
-                    image_bytes = base_image["image"]
+            for p in range(len(pdf_doc)):
+                for xref, *_ in pdf_doc[p].get_images(full=True):
+                    img_bytes = pdf_doc.extract_image(xref)["image"]
+                    h = hashlib.md5(img_bytes).hexdigest()
+                    cur.execute("SELECT 1 FROM documents WHERE image_hash=%s", (h,))
+                    if cur.fetchone():
+                        continue      # 已入庫
 
-                    img_hash = hashlib.md5(image_bytes).hexdigest()
-                    if img_hash in seen_hashes:
-                        continue
-                    seen_hashes.add(img_hash)
+                    img_name = f"{df.name}_p{p+1}_{xref}.png"
+                    save_as  = os.path.join(IMAGE_FOLDER, img_name)
+                    with open(save_as, "wb") as f:
+                        f.write(img_bytes)
 
-                    image_filename = f"{doc_file.name}_page{page_index+1}_xref{xref}.png"
-                    image_path = os.path.join(IMAGE_FOLDER, image_filename)
-                    with open(image_path, "wb") as f:
-                        f.write(image_bytes)
+                    txt = pytesseract.image_to_string(Image.open(save_as),
+                                                      lang="chi_tra+eng").strip()
+                    vec_s = None
+                    if txt:
+                        vec   = embedding_model.embed_query(txt)
+                        vec_s = "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
 
-                    image = Image.open(image_path)
-                    text = pytesseract.image_to_string(image, lang="chi_tra+eng").strip()
-
-                    if text:
-                        vector = embedding_model.embed_query(text)
-                        vector_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
-                        cur.execute(
-                            """
-                            INSERT INTO documents (content, embedding, source_type, filename, page_num, image_ref, image_desc)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                            """,
-                            (text, vector_str, 'ocr_image', doc_file.name, page_index+1, image_filename, None)
-                        )
-conn.commit()
+                    cur.execute("""
+                        INSERT INTO documents (content, embedding, source_type,
+                                               filename, page_num,
+                                               image_ref, image_desc,
+                                               image_hash, upload_time)
+                        VALUES (%s,%s,'ocr_image',%s,%s,%s,NULL,%s,%s)
+                    """, (txt or None, vec_s, df.name, p+1, img_name,
+                          h, datetime.datetime.utcnow()))
+        conn.commit()
+        st.success(f"✅ 已處理 {df.name}")
 
 
 st.header("🗃️ 文件管理與刪除")
@@ -179,68 +188,61 @@ else:
 
 # 📋 圖片註解功能（依來源與檔案過濾）
 st.header("🖼 圖片註解與管理")
-source_type = st.radio("選擇圖片來源類型", ["ocr_image", "uploaded_image"])
+src_type = st.radio("圖片來源", ["ocr_image", "uploaded_image"])
 
-cur.execute("SELECT DISTINCT filename FROM documents WHERE source_type = %s", (source_type,))
-available_files = [row[0] for row in cur.fetchall() if row[0]]
-selected_file = st.selectbox("選擇來源檔案（PDF或圖片檔）", available_files)
+cur.execute("""
+    SELECT DISTINCT filename, MIN(upload_time) AS t
+    FROM documents
+    WHERE source_type=%s
+    GROUP BY filename ORDER BY t DESC
+""", (src_type,))
+options = [r[0] for r in cur.fetchall()]
+file_sel = st.selectbox("選擇檔名", options)
 
-if selected_file:
-    if source_type == "ocr_image":
-        cur.execute("""
-            SELECT image_ref, image_desc, page_num FROM documents
-            WHERE source_type = %s AND filename = %s
-            ORDER BY page_num ASC, image_ref ASC
-        """, (source_type, selected_file))
-    else:
-        cur.execute("""
-            SELECT image_ref, image_desc, page_num FROM documents
-            WHERE source_type = %s AND filename = %s
-            ORDER BY image_ref ASC
-        """, (source_type, selected_file))
-
+if file_sel:
+    cur.execute("""
+        SELECT image_ref, image_desc, page_num
+        FROM documents
+        WHERE source_type=%s AND filename=%s
+        ORDER BY page_num NULLS FIRST, upload_time
+    """, (src_type, file_sel))
     rows = cur.fetchall()
 
-for idx, (image_ref, image_desc, page_num) in enumerate(rows):
-    image_path = os.path.join(IMAGE_FOLDER, image_ref)
-    if not os.path.exists(image_path):
-        continue
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col1:
-        st.image(image_path, width=200, caption=f"頁碼 {page_num}" if page_num else None)
-    with col2:
-        st.markdown(f"**檔名：** {image_ref}")
-        new_desc = st.text_input(
-            f"輸入描述", 
-            value=image_desc or "", 
-            key=f"desc_{image_ref}_{idx}"
-        )
-        if st.button(f"💾 儲存註解 - {image_ref}", key=f"save_{image_ref}_{idx}"):
-            clean_desc = new_desc.strip()
-            cur.execute("UPDATE documents SET image_desc = %s WHERE image_ref = %s", 
-                        (clean_desc if clean_desc else None, image_ref))
-
-            if clean_desc and clean_desc != (image_desc or ""):
-                # 有新註解 → 生成向量
-                vector = embedding_model.embed_query(clean_desc)
-                vector_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
-                cur.execute("UPDATE documents SET embedding = %s WHERE image_ref = %s", (vector_str, image_ref))
-            elif not clean_desc:
-                # 沒有註解 → 把向量設為 NULL
-                cur.execute("UPDATE documents SET embedding = NULL WHERE image_ref = %s", (image_ref,))
-            
-            conn.commit()
-            st.success(f"✅ 已更新 {image_ref} 的註解與向量")
-    with col3:
-        if st.button(f"🗑 刪除圖片 - {image_ref}", key=f"delete_{image_ref}_{idx}"):
-            try:
-                os.remove(image_path)
-                cur.execute("DELETE FROM documents WHERE image_ref = %s", (image_ref,))
+    for ir, desc, pg in rows:
+        img_path = os.path.join(IMAGE_FOLDER, ir)
+        if not os.path.exists(img_path):
+            continue
+        col1, col2, col3 = st.columns([1,2,1])
+        with col1:
+            st.image(img_path, width=200, caption=f"頁 {pg}" if pg else "")
+        with col2:
+            new_desc = st.text_input("描述", value=desc or "",
+                                     key=f"d_{ir}")
+            if st.button("💾 儲存", key=f"s_{ir}"):
+                vec_s = None
+                if new_desc.strip():
+                    vec   = embedding_model.embed_query(new_desc.strip())
+                    vec_s = "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
+                cur.execute("""
+                    UPDATE documents
+                    SET image_desc=%s, embedding=%s
+                    WHERE image_ref=%s
+                """, (new_desc.strip() or None, vec_s, ir))
                 conn.commit()
-                st.warning(f"❌ 已刪除圖片 {image_ref} 與其向量紀錄")
-                st.rerun()
-            except Exception as e:
-                st.error(f"刪除失敗：{e}")
-    
-cur.close()
-conn.close()
+                st.success("已更新")
+
+        with col3:
+            if st.button("🗑 刪除", key=f"del_{ir}"):
+                try:
+                    # 若只剩自己一條紀錄才刪實體檔
+                    cur.execute("SELECT COUNT(*) FROM documents WHERE image_ref=%s", (ir,))
+                    if cur.fetchone()[0] == 1 and os.path.exists(img_path):
+                        os.remove(img_path)
+                    cur.execute("DELETE FROM documents WHERE image_ref=%s", (ir,))
+                    conn.commit()
+                    st.warning("已刪除")
+                    st.experimental_rerun()
+                except Exception as e:
+                    st.error(f"刪除失敗：{e}")
+
+cur.close(); conn.close()
