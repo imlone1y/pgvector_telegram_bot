@@ -69,6 +69,8 @@ Once modified successfully, the agent will confirm by replying with the updated 
 | image_ref     | text           | Image file name (actual file)                 |
 | image_desc    | text           | Manually input image description              |
 | source_type   | text           | Source type (`ocr_image`, `uploaded_image`, `pdf_text`, etc.) |
+| image_hash    | varchar        | MD5 hash of image content (used to detect duplicates) |
+| upload_time   | timestamp      | Actual upload timestamp when record was inserted |
 
 #### Table: `upload_files`
 
