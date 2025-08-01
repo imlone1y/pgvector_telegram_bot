@@ -175,20 +175,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- PDF ----------
     if msg.document and msg.document.mime_type == "application/pdf":
-        file = await context.bot.get_file(msg.document.file_id)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            await file.download_to_drive(custom_path=tmp.name)
-            await process_pdf(tmp.name)
-        await msg.reply_text("✅ PDF 內容與圖片已寫入資料庫")
+        tg_file = await context.bot.get_file(msg.document.file_id)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        await tg_file.download_to_drive(tmp.name)
+        tmp.close()
+        await process_pdf(tmp.name)
+        await msg.reply_text("✅ PDF 已儲存並處理")
         return
 
     # ---------- Photo ----------
     if msg.photo:
-        file = await context.bot.get_file(msg.photo[-1].file_id)
-        bio  = BytesIO()
-        await file.download(out=bio)
-        await process_photo(bio.getvalue(), f"{msg.photo[-1].file_id}.jpg")
-        await msg.reply_text("✅ 圖片已寫入資料庫")
+        tg_file = await context.bot.get_file(msg.photo[-1].file_id)
+        bio = BytesIO()
+        await tg_file.download_to_memory(out=bio)
+        img_bytes = bio.getvalue()
+        await process_photo(img_bytes, f"{msg.photo[-1].file_id}.jpg")
+        await msg.reply_text("✅ 圖片已處理並寫入資料庫")
         return
 
     # ---------- Text ----------
