@@ -1,10 +1,3 @@
-"""
-Telegram Bot － 對齊新版 documents 資料表
-columns: id, page_num, content, embedding, created_at,
-         image_ref, image_desc, source_type, filename,
-         image_hash, upload_time
-"""
-
 import os, uuid, hashlib, datetime, tempfile, json
 from io import BytesIO
 import psycopg2, fitz, pytesseract
@@ -113,8 +106,8 @@ async def process_photo(img_bytes, original_name):
                                   'uploaded_image', original_name)
         conn.commit()
 
-# ---------- 文字問答 / 修改 -------------------------------------------------
-async def qa_or_modify(user_msg: str, bot_send):
+# ---------- 文字問答 / 修改（含：回傳相近圖片） -----------------------------
+async def qa_or_modify(user_msg: str, send_text, send_photo):
     # 1) 判斷是否為「修改」指令
     sys_prompt = f"""
 你是一個幫助使用者修改資料庫內容的助手。
@@ -139,15 +132,18 @@ async def qa_or_modify(user_msg: str, bot_send):
                                    WHERE id=%s""",
                                 (j["new_text"], new_vec_str, row[0]))
                     conn.commit()
-                    await bot_send(f"✅ 已將「{j['old_text']}」更新為「{j['new_text']}」")
+                    await send_text(f"✅ 已將「{j['old_text']}」更新為「{j['new_text']}」")
                     return
-            await bot_send("找不到要修改的內容，請確認原始內容是否存在")
+            await send_text("找不到要修改的內容，請確認原始內容是否存在")
             return
     except Exception as e:
         print("判斷修改語句失敗：", e)
 
     # 2) 問答流程
-    vec_str = vector_to_str(embedding_model.embed_query(user_msg))
+    vec = embedding_model.embed_query(user_msg)
+    vec_str = vector_to_str(vec)
+
+    # 2a) 取前 3 筆相似內容組成 context
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT content, image_ref
@@ -162,7 +158,34 @@ async def qa_or_modify(user_msg: str, bot_send):
         {"role":"system","content":f"Use this context:\n{context}"},
         {"role":"user","content":user_msg}
     ]).content
-    await bot_send(answer)
+    await send_text(answer)
+
+    # 2b) 附圖回覆：找最近的有圖紀錄並回傳
+    try:
+        with db_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT image_ref, content
+                FROM documents
+                WHERE image_ref IS NOT NULL
+                ORDER BY embedding <-> %s
+                LIMIT 3
+            """, (vec_str,))
+            imgs = cur.fetchall()
+
+        for image_ref, c in imgs:
+            if not image_ref:
+                continue
+            img_path = os.path.join(IMAGE_DIR, image_ref)
+            if os.path.exists(img_path):
+                # 簡短 caption（最多 300 字）
+                caption = None
+                if c:
+                    c = c.strip()
+                    caption = (c[:300] + "…") if len(c) > 300 else c
+                await send_photo(img_path, caption=caption)
+                break  # 只回傳第一張存在的圖
+    except Exception as e:
+        print("回傳圖片流程錯誤：", e)
 
 # ---------- Telegram Handler ----------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -172,6 +195,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.text and msg.text.strip() == "/start":
         await msg.reply_text("初始化完成，可以開始使用")
         return
+
+    # 小幫手：送圖（確保檔案關閉）
+    async def _send_photo(path, caption=None):
+        try:
+            with open(path, "rb") as f:
+                await msg.reply_photo(photo=f, caption=caption)
+        except Exception as e:
+            print("reply_photo 失敗：", e)
 
     # ---------- PDF ----------
     if msg.document and msg.document.mime_type == "application/pdf":
@@ -195,7 +226,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- Text ----------
     if msg.text:
-        await qa_or_modify(msg.text.strip(), msg.reply_text)
+        await qa_or_modify(msg.text.strip(), msg.reply_text, _send_photo)
         return
 
 # ---------- Bot 啟動 -------------------------------------------------------
