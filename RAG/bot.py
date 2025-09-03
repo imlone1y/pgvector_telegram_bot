@@ -28,6 +28,10 @@ PG_CONF = dict(
     password=os.environ["PG_PASSWORD"]
 )
 
+# ---- 相似度門檻（cosine distance；越小越像） -------------------------------
+IMG_SIM_THRESHOLD = float(os.getenv("IMG_SIM_THRESHOLD", "0.75"))
+IMG_TOPK = int(os.getenv("IMG_TOPK", "5"))
+
 # ---------- 共用小函式 ------------------------------------------------------
 def db_conn():
     return psycopg2.connect(**PG_CONF)
@@ -106,7 +110,7 @@ async def process_photo(img_bytes, original_name):
                                   'uploaded_image', original_name)
         conn.commit()
 
-# ---------- 文字問答 / 修改（含：回傳相近圖片） -----------------------------
+# ---------- 文字問答 / 修改（只在相符時回圖；不回 OCR 文字） -----------------
 async def qa_or_modify(user_msg: str, send_text, send_photo):
     # 1) 判斷是否為「修改」指令
     sys_prompt = f"""
@@ -143,11 +147,12 @@ async def qa_or_modify(user_msg: str, send_text, send_photo):
     vec = embedding_model.embed_query(user_msg)
     vec_str = vector_to_str(vec)
 
-    # 2a) 取前 3 筆相似內容組成 context
+    # 2a) 取前 3 筆相似內容組成 context（只拿有 embedding 的）
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT content, image_ref
+            SELECT content
             FROM documents
+            WHERE embedding IS NOT NULL
             ORDER BY embedding <-> %s
             LIMIT 3
         """, (vec_str,))
@@ -160,30 +165,26 @@ async def qa_or_modify(user_msg: str, send_text, send_photo):
     ]).content
     await send_text(answer)
 
-    # 2b) 附圖回覆：找最近的有圖紀錄並回傳
+    # 2b) 只有在相似度達標時才回傳圖片（不含任何文字）
+    #     使用 cosine distance `<=>`（需 pgvector 支援；未建索引也能執行，但較慢）
     try:
         with db_conn() as conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT image_ref, content
+            cur.execute(f"""
+                SELECT image_ref, (embedding <=> %s) AS dist
                 FROM documents
                 WHERE image_ref IS NOT NULL
-                ORDER BY embedding <-> %s
-                LIMIT 3
+                  AND embedding IS NOT NULL
+                ORDER BY dist ASC
+                LIMIT {IMG_TOPK}
             """, (vec_str,))
             imgs = cur.fetchall()
 
-        for image_ref, c in imgs:
-            if not image_ref:
-                continue
-            img_path = os.path.join(IMAGE_DIR, image_ref)
-            if os.path.exists(img_path):
-                # 簡短 caption（最多 300 字）
-                caption = None
-                if c:
-                    c = c.strip()
-                    caption = (c[:300] + "…") if len(c) > 300 else c
-                await send_photo(img_path, caption=caption)
-                break  # 只回傳第一張存在的圖
+        for image_ref, dist in imgs:
+            if image_ref and dist is not None and dist <= IMG_SIM_THRESHOLD:
+                img_path = os.path.join(IMAGE_DIR, image_ref)
+                if os.path.exists(img_path):
+                    await send_photo(img_path)   # ← 不傳 caption，只傳圖片
+                    break  # 只回第一張達標圖
     except Exception as e:
         print("回傳圖片流程錯誤：", e)
 
@@ -196,11 +197,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("初始化完成，可以開始使用")
         return
 
-    # 小幫手：送圖（確保檔案關閉）
-    async def _send_photo(path, caption=None):
+    # 小幫手：送圖（確保檔案關閉；不帶 caption）
+    async def _send_photo(path):
         try:
             with open(path, "rb") as f:
-                await msg.reply_photo(photo=f, caption=caption)
+                await msg.reply_photo(photo=f)
         except Exception as e:
             print("reply_photo 失敗：", e)
 
