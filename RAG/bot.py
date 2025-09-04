@@ -18,7 +18,7 @@ embedding_model = OpenAIEmbeddings(
     model="text-embedding-3-small",
     api_key=os.getenv("OPENAI_API_KEY")
 )
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = ChatOpenAI(model="gpt-5", temperature=1)
 
 PG_CONF = dict(
     host=os.environ["PG_HOST"],
