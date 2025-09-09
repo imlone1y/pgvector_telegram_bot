@@ -9,6 +9,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
+# ---------- 基礎設定 --------------------------------------------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 IMAGE_DIR  = "image_dir"; os.makedirs(IMAGE_DIR, exist_ok=True)
@@ -19,6 +20,12 @@ embedding_model = OpenAIEmbeddings(
 )
 llm = ChatOpenAI(model="gpt-5", temperature=1)
 
+STRICT_SYS_PROMPT = """1. 只引用來源能支持的內容；不可外部常識延伸。
+2. 每一句話後面都必須加上 [doc_id:段落或頁碼] 引用；若沒有足夠來源，就不回答。
+3. 禁止使用來源未出現的數字、名詞定義與結論。
+4. 禁止改寫成與原意矛盾的說法；對專有名詞保留原文。"""
+
+
 PG_CONF = dict(
     host=os.environ["PG_HOST"],
     port=os.environ["PG_PORT"],
@@ -27,9 +34,11 @@ PG_CONF = dict(
     password=os.environ["PG_PASSWORD"]
 )
 
+# ---- 相似度門檻（cosine distance；越小越像） -------------------------------
 IMG_SIM_THRESHOLD = float(os.getenv("IMG_SIM_THRESHOLD", "0.75"))
 IMG_TOPK = int(os.getenv("IMG_TOPK", "5"))
 
+# ---------- 共用小函式 ------------------------------------------------------
 def db_conn():
     return psycopg2.connect(**PG_CONF)
 
@@ -69,6 +78,7 @@ def save_image_and_insert(cur, img_bytes, ocr_text,
           filename, page_num,
           image_ref, img_hash, datetime.datetime.utcnow()))
 
+# ---------- PDF 上傳處理 ----------------------------------------------------
 async def process_pdf(file_path):
     filename  = os.path.basename(file_path)
     loader    = PyPDFLoader(file_path)
@@ -106,6 +116,7 @@ async def process_photo(img_bytes, original_name):
                                   'uploaded_image', original_name)
         conn.commit()
 
+# ---------- 文字問答 / 修改（只在相符時回圖；不回 OCR 文字） -----------------
 async def qa_or_modify(user_msg: str, send_text, send_photo):
     # 1) 判斷是否為「修改」指令
     sys_prompt = f"""
@@ -141,7 +152,7 @@ async def qa_or_modify(user_msg: str, send_text, send_photo):
     # 2) 問答流程
     vec = embedding_model.embed_query(user_msg)
     vec_str = vector_to_str(vec)
-
+    
     # 2a) 取前 3 筆相似內容組成 context（含來源資訊）
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -165,17 +176,23 @@ async def qa_or_modify(user_msg: str, send_text, send_photo):
 
     context = "\n".join(context_parts)
 
+    # 嚴格只用 Context 回答
+    if not context.strip():
+        await send_text("我不知道。無法在你提供的資料中找到足夠資訊，請上傳或提供更多相關內容。")
+        return
+
     answer = llm.invoke([
-        {"role":"system","content":f"Use this context:\n{context}"},
-        {"role":"user","content":user_msg}
+        {"role": "system", "content": STRICT_SYS_PROMPT},
+        {"role": "system", "content": f"Context:\n{context}"},
+        {"role": "user",   "content": user_msg}
     ]).content
+
 
     # 回覆答案 + 資料來源
     if sources:
         answer += "\n\n📖 資料來源:\n" + "\n".join(f"- {s}" for s in sources)
 
     await send_text(answer)
-
 
     # 2b) 只有在相似度達標時才回傳圖片（不含任何文字）
     #     使用 cosine distance `<=>`（需 pgvector 支援；未建索引也能執行，但較慢）
