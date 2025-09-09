@@ -9,7 +9,6 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
-# ---------- 基礎設定 --------------------------------------------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 IMAGE_DIR  = "image_dir"; os.makedirs(IMAGE_DIR, exist_ok=True)
@@ -28,11 +27,9 @@ PG_CONF = dict(
     password=os.environ["PG_PASSWORD"]
 )
 
-# ---- 相似度門檻（cosine distance；越小越像） -------------------------------
 IMG_SIM_THRESHOLD = float(os.getenv("IMG_SIM_THRESHOLD", "0.75"))
 IMG_TOPK = int(os.getenv("IMG_TOPK", "5"))
 
-# ---------- 共用小函式 ------------------------------------------------------
 def db_conn():
     return psycopg2.connect(**PG_CONF)
 
@@ -72,7 +69,6 @@ def save_image_and_insert(cur, img_bytes, ocr_text,
           filename, page_num,
           image_ref, img_hash, datetime.datetime.utcnow()))
 
-# ---------- PDF 上傳處理 ----------------------------------------------------
 async def process_pdf(file_path):
     filename  = os.path.basename(file_path)
     loader    = PyPDFLoader(file_path)
@@ -110,7 +106,6 @@ async def process_photo(img_bytes, original_name):
                                   'uploaded_image', original_name)
         conn.commit()
 
-# ---------- 文字問答 / 修改（只在相符時回圖；不回 OCR 文字） -----------------
 async def qa_or_modify(user_msg: str, send_text, send_photo):
     # 1) 判斷是否為「修改」指令
     sys_prompt = f"""
@@ -147,10 +142,10 @@ async def qa_or_modify(user_msg: str, send_text, send_photo):
     vec = embedding_model.embed_query(user_msg)
     vec_str = vector_to_str(vec)
 
-    # 2a) 取前 3 筆相似內容組成 context（只拿有 embedding 的）
+    # 2a) 取前 3 筆相似內容組成 context（含來源資訊）
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT content
+            SELECT content, filename, page_num, source_type
             FROM documents
             WHERE embedding IS NOT NULL
             ORDER BY embedding <-> %s
@@ -158,12 +153,29 @@ async def qa_or_modify(user_msg: str, send_text, send_photo):
         """, (vec_str,))
         top = cur.fetchall()
 
-    context = "\n".join(t[0] for t in top if t[0])
+    context_parts = []
+    sources = []
+    for content, filename, page_num, source_type in top:
+        if content:
+            context_parts.append(content)
+            src = f"{filename}"
+            if page_num: src += f" p.{page_num}"
+            if source_type: src += f" ({source_type})"
+            sources.append(src)
+
+    context = "\n".join(context_parts)
+
     answer = llm.invoke([
         {"role":"system","content":f"Use this context:\n{context}"},
         {"role":"user","content":user_msg}
     ]).content
+
+    # 回覆答案 + 資料來源
+    if sources:
+        answer += "\n\n📖 資料來源:\n" + "\n".join(f"- {s}" for s in sources)
+
     await send_text(answer)
+
 
     # 2b) 只有在相似度達標時才回傳圖片（不含任何文字）
     #     使用 cosine distance `<=>`（需 pgvector 支援；未建索引也能執行，但較慢）
