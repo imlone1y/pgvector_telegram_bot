@@ -118,6 +118,8 @@ async def process_photo(img_bytes, original_name):
 
 # ---------- 文字問答 / 修改（只在相符時回圖；不回 OCR 文字） -----------------
 async def qa_or_modify(user_msg: str, send_text, send_photo):
+
+    await send_text("請稍等，正在查詢資料中...")
     # 1) 判斷是否為「修改」指令
     sys_prompt = f"""
 你是一個幫助使用者修改資料庫內容的助手。
@@ -263,3 +265,4 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(MessageHandler(filters.ALL, handle_message))
 app.run_polling()
+
