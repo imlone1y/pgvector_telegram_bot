@@ -20,11 +20,12 @@ embedding_model = OpenAIEmbeddings(
 )
 llm = ChatOpenAI(model="gpt-5", temperature=1)
 
+# 重點調整：允許在無依據時直接回「我不知道」且不強制引用標註
 STRICT_SYS_PROMPT = """1. 只引用來源能支持的內容；不可外部常識延伸。
-2. 每一句話後面都必須加上 [doc_id:段落或頁碼] 引用；若沒有足夠來源，就不回答。
-3. 禁止使用來源未出現的數字、名詞定義與結論。
-4. 禁止改寫成與原意矛盾的說法；對專有名詞保留原文。"""
-
+2. 若有足夠來源依據，回答的每一句話後面都必須加上 [doc_id:段落或頁碼] 引用。
+3. 若沒有足夠來源，就回覆：「我不知道。需要更多資訊。」且不要附加任何引用標註。
+4. 禁止使用來源未出現的數字、名詞定義與結論。
+5. 禁止改寫成與原意矛盾的說法；對專有名詞保留原文。"""
 
 PG_CONF = dict(
     host=os.environ["PG_HOST"],
@@ -116,9 +117,27 @@ async def process_photo(img_bytes, original_name):
                                   'uploaded_image', original_name)
         conn.commit()
 
-# ---------- 文字問答 / 修改（只在相符時回圖；不回 OCR 文字） -----------------
-async def qa_or_modify(user_msg: str, send_text, send_photo):
+# ---------- 不確定性偵測（關鍵新增） ----------------------------------------
+def is_uncertain(text: str) -> bool:
+    if not text:
+        return True
+    t = text.strip().lower()
+    # 常見不確定回覆關鍵詞（中英）
+    cues = [
+        "我不知道", "不清楚", "無法回答", "無從判斷", "需要更多資訊",
+        "找不到足夠", "沒有足夠依據", "資訊不足", "無足夠依據",
+        "unable to answer", "not sure", "insufficient", "need more information"
+    ]
+    # 任一關鍵詞命中即視為不確定
+    if any(c.lower() in t for c in cues):
+        return True
+    # 若看起來只有很短的一句否定，也視為不確定
+    if len(t) <= 20 and ("不知道" in t or "不清楚" in t):
+        return True
+    return False
 
+# ---------- 文字問答 / 修改（不確定時不顯示來源、不傳圖片） -------------------
+async def qa_or_modify(user_msg: str, send_text, send_photo):
     await send_text("請稍等，正在查詢資料中...")
     # 1) 判斷是否為「修改」指令
     sys_prompt = f"""
@@ -178,9 +197,9 @@ async def qa_or_modify(user_msg: str, send_text, send_photo):
 
     context = "\n".join(context_parts)
 
-    # 嚴格只用 Context 回答
+    # 嚴格只用 Context 回答；若 context 為空，直接回不知道（且不顯示來源，不傳圖片）
     if not context.strip():
-        await send_text("我不知道。無法在你提供的資料中找到足夠資訊，請上傳或提供更多相關內容。")
+        await send_text("我不知道。需要更多資訊。")
         return
 
     answer = llm.invoke([
@@ -189,15 +208,18 @@ async def qa_or_modify(user_msg: str, send_text, send_photo):
         {"role": "user",   "content": user_msg}
     ]).content
 
+    # 依不確定性決定是否附上資料來源，以及是否傳圖片
+    uncertain = is_uncertain(answer)
 
-    # 回覆答案 + 資料來源
-    if sources:
+    if not uncertain and sources:
         answer += "\n\n📖 資料來源:\n" + "\n".join(f"- {s}" for s in sources)
 
     await send_text(answer)
 
-    # 2b) 只有在相似度達標時才回傳圖片（不含任何文字）
-    #     使用 cosine distance `<=>`（需 pgvector 支援；未建索引也能執行，但較慢）
+    # 2b) 只有「確定」時才嘗試回傳圖片（不含任何文字）
+    if uncertain:
+        return
+
     try:
         with db_conn() as conn, conn.cursor() as cur:
             cur.execute(f"""
@@ -265,4 +287,3 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(MessageHandler(filters.ALL, handle_message))
 app.run_polling()
-
