@@ -74,8 +74,8 @@ Once modified successfully, the agent will confirm by replying with the updated 
 | upload_file_id| integer        | seperate files                                |
 
 indexes:
-- documents_pkey (PK)
-- idx_documents_upload_file_id (btree, upload_file_id)
+- `documents_pkey` (PK)
+- `idx_documents_upload_file_id` (btree, upload_file_id)
 
 #### Table: `upload_files`
 
