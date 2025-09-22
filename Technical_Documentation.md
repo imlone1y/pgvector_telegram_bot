@@ -86,6 +86,7 @@ indexes:
 | file_type     | text           | File type (`pdf`, `jpg`, `txt`)  |
 | upload_time   | timestamp      | Upload time, default: CURRENT_TIMESTAMP |
 | file_md5      | varchar        | context only one (MD5)           |
+| file_code     | integer        | sequence id of files             |
 
 indexes:
 - `upload_files_pkey (PK)` (PK)
