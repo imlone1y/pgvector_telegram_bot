@@ -68,6 +68,12 @@
 | source_type  | text           | 來源類型（如 `ocr_image`、`uploaded_image`、`pdf_text`） |
 | image_hash   | varchar        | 圖片內容的 MD5 雜湊，用於檢查是否重複上傳相同圖片 |
 | upload_time  | timestamp      | 實際資料寫入的時間（精確記錄每筆上傳時間，非預設欄位） |
+| upload_file_id| integer       | 指向 `upload_files.id`；檔案級隔離 的關鍵欄位 |
+
+indexes:
+- `documents_pkey` (PK)
+- `idx_documents_upload_file_id` (btree, upload_file_id)
+
 
 #### Table: `upload_files`
 
