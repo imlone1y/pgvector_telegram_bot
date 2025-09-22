@@ -1,10 +1,10 @@
-import os, uuid, hashlib, datetime, tempfile, json
+import os, re, uuid, hashlib, datetime, tempfile, json
 from io import BytesIO
 import psycopg2, fitz, pytesseract
 from PIL import Image
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -12,20 +12,19 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 # ---------- 基礎設定 --------------------------------------------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-IMAGE_DIR  = "image_dir"; os.makedirs(IMAGE_DIR, exist_ok=True)
+IMAGE_DIR = "image_dir";       os.makedirs(IMAGE_DIR, exist_ok=True)
+FILE_DIR  = "uploaded_files";  os.makedirs(FILE_DIR, exist_ok=True)
 
 embedding_model = OpenAIEmbeddings(
-    model="text-embedding-3-small",
+    model="text-embedding-3-large",          # ← 請確認和 DB 的向量維度一致
     api_key=os.getenv("OPENAI_API_KEY")
 )
 llm = ChatOpenAI(model="gpt-5", temperature=1)
 
-# 重點調整：允許在無依據時直接回「我不知道」且不強制引用標註
-STRICT_SYS_PROMPT = """1. 只引用來源能支持的內容；不可外部常識延伸。
-2. 若有足夠來源依據，回答的每一句話後面都必須加上 [doc_id:段落或頁碼] 引用。
-3. 若沒有足夠來源，就回覆：「我不知道。需要更多資訊。」且不要附加任何引用標註。
-4. 禁止使用來源未出現的數字、名詞定義與結論。
-5. 禁止改寫成與原意矛盾的說法；對專有名詞保留原文。"""
+STRICT_SYS_PROMPT = """1. 僅使用下方 Context 的內容回答；不得加入外部常識或臆測。
+2. 若 Context 無法支持答案，請直接回覆：「我不知道。需要更多資訊。」不要在答案內加入任何引用或標註。
+3. 禁止虛構數字、名詞定義與結論；對專有名詞保留原文。
+4. 答案力求精確、簡潔。"""
 
 PG_CONF = dict(
     host=os.environ["PG_HOST"],
@@ -35,9 +34,13 @@ PG_CONF = dict(
     password=os.environ["PG_PASSWORD"]
 )
 
-# ---- 相似度門檻（cosine distance；越小越像） -------------------------------
-IMG_SIM_THRESHOLD = float(os.getenv("IMG_SIM_THRESHOLD", "0.75"))
-IMG_TOPK = int(os.getenv("IMG_TOPK", "5"))
+# 回答時使用幾段、以及距離門檻（<=> 越小越相似）
+SRC_TOPK = int(os.getenv("SRC_TOPK", "2"))
+SRC_SIM_THRESHOLD  = float(os.getenv("SRC_SIM_THRESHOLD", "0.60"))
+SRC_FALLBACK_MAX   = float(os.getenv("SRC_FALLBACK_MAX",  "0.85"))
+
+# 僅允許「ID: 問題」格式
+ID_QUERY_RE = re.compile(r"^\s*(\d+)\s*[:：]\s*(.+)$")
 
 # ---------- 共用小函式 ------------------------------------------------------
 def db_conn():
@@ -46,25 +49,71 @@ def db_conn():
 def vector_to_str(vec):
     return "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
 
-def insert_pdf_text(cur, content, filename):
+def md5_bytes(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest()
+
+def list_files(limit: int = 100):
+    sql = """
+    SELECT id, file_name, file_type,
+           COALESCE(to_char(upload_time,'YYYY-MM-DD HH24:MI'), '')
+    FROM upload_files
+    ORDER BY id DESC
+    LIMIT %s
+    """
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, (limit,))
+        return cur.fetchall()
+
+def list_files_text(limit: int = 100) -> str:
+    rows = list_files(limit)
+    if not rows:
+        return "目前沒有任何檔案。請先上傳。"
+    lines = ["可查詢的檔案清單（輸入 `ID: 問題` 開始查詢）："]
+    for rid, name, ftype, ts in rows:
+        lines.append(f"• {rid} | {name} ({ftype}) {ts}")
+    return "\n".join(lines)
+
+def get_or_create_upload_file_by_md5(file_name: str, file_type: str, file_md5: str) -> int:
+    """
+    以 file_md5 做唯一鍵。需要 DB 先有：
+      ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS file_md5 varchar;
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_upload_files_file_md5 ON upload_files(file_md5);
+    """
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM upload_files WHERE file_md5=%s", (file_md5,))
+        row = cur.fetchone()
+        if row:
+            return row[0]
+        cur.execute("""
+            INSERT INTO upload_files (file_name, file_type, file_md5, upload_time)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (file_md5) DO UPDATE SET file_name = EXCLUDED.file_name
+            RETURNING id
+        """, (file_name, file_type, file_md5))
+        fid = cur.fetchone()[0]
+        conn.commit()
+        return fid
+
+def insert_pdf_text(cur, content, filename, upload_file_id: int):
     vec_str = vector_to_str(embedding_model.embed_query(content))
     cur.execute("""
         INSERT INTO documents (content, embedding, source_type,
-                               filename, upload_time)
-        VALUES (%s,%s,'pdf_text',%s,%s)
-    """, (content, vec_str, filename, datetime.datetime.utcnow()))
+                               filename, upload_time, upload_file_id)
+        VALUES (%s,%s,'pdf_text',%s,%s,%s)
+    """, (content, vec_str, filename, datetime.datetime.utcnow(), upload_file_id))
 
 def save_image_and_insert(cur, img_bytes, ocr_text,
-                          source_type, filename, page_num=None):
-    # 計算 hash，若重複就略過
-    img_hash = hashlib.md5(img_bytes).hexdigest()
+                          source_type, filename, upload_file_id: int, page_num=None):
+    # 依圖片內容去重
+    img_hash = md5_bytes(img_bytes)
     cur.execute("SELECT 1 FROM documents WHERE image_hash=%s", (img_hash,))
     if cur.fetchone():
         return
 
     image_ref = f"{uuid.uuid4().hex}_{filename}"
     img_path  = os.path.join(IMAGE_DIR, image_ref)
-    with open(img_path, "wb") as f: f.write(img_bytes)
+    with open(img_path, "wb") as f:
+        f.write(img_bytes)
 
     vec_str = None
     if ocr_text:
@@ -73,184 +122,155 @@ def save_image_and_insert(cur, img_bytes, ocr_text,
     cur.execute("""
         INSERT INTO documents (content, embedding, source_type,
                                filename, page_num,
-                               image_ref, image_hash, upload_time)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                               image_ref, image_hash, upload_time,
+                               upload_file_id)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (ocr_text or None, vec_str, source_type,
           filename, page_num,
-          image_ref, img_hash, datetime.datetime.utcnow()))
+          image_ref, img_hash, datetime.datetime.utcnow(),
+          upload_file_id))
 
-# ---------- PDF 上傳處理 ----------------------------------------------------
+def search_by_file_id(file_id: int, query: str, k: int = 8):
+    """僅在指定 upload_file_id 範圍內檢索內容段落。"""
+    qvec = embedding_model.embed_query(query)
+    qstr = vector_to_str(qvec)
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT content, filename, page_num, source_type,
+                   (embedding <=> %s) AS dist
+            FROM documents
+            WHERE upload_file_id = %s
+              AND embedding IS NOT NULL
+            ORDER BY dist ASC
+            LIMIT %s
+        """, (qstr, file_id, k))
+        return cur.fetchall()
+
+def build_rag_prompt(query: str, rows):
+    # rows: (content, filename, page_num, source_type, dist)
+    context_parts, sources = [], []
+    for content, filename, page_num, source_type, dist in rows:
+        if not content or dist is None or dist > SRC_SIM_THRESHOLD:
+            continue
+        context_parts.append(content)
+        src = f"{filename}"
+        if page_num: src += f" p.{page_num}"
+        if source_type: src += f" ({source_type})"
+        sources.append(src)
+        if len(context_parts) >= SRC_TOPK:
+            break
+
+    if not context_parts and rows:
+        # 保底：拿最相似的一段，但距離要 <= SRC_FALLBACK_MAX
+        best_content, best_filename, best_page, best_type, best_dist = rows[0]
+        if best_content and best_dist is not None and best_dist <= SRC_FALLBACK_MAX:
+            context_parts.append(best_content)
+            src = f"{best_filename}"
+            if best_page: src += f" p.{best_page}"
+            if best_type: src += f" ({best_type})"
+            sources.append(src)
+
+    context = "\n".join(context_parts)
+    messages = [
+        {"role": "system", "content": STRICT_SYS_PROMPT},
+        {"role": "system", "content": f"Context:\n{context}"},
+        {"role": "user",   "content": query}
+    ]
+    return context, messages, sources
+
+# ---------- PDF 上傳處理（含 MD5 冪等） ------------------------------------
 async def process_pdf(file_path):
-    filename  = os.path.basename(file_path)
-    loader    = PyPDFLoader(file_path)
-    pdf_doc   = fitz.open(file_path)
-    splitter  = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
+    filename = os.path.basename(file_path)
+    with open(file_path, "rb") as f:
+        pdf_bytes = f.read()
+    pdf_md5 = md5_bytes(pdf_bytes)
+
+    upload_file_id = get_or_create_upload_file_by_md5(filename, "pdf", pdf_md5)
+
+    # 若此 ID 之前已處理過，就直接略過
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM documents WHERE upload_file_id=%s LIMIT 1", (upload_file_id,))
+        if cur.fetchone():
+            return upload_file_id
+
+    loader   = PyPDFLoader(file_path)
+    pdf_doc  = fitz.open(file_path)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
 
     with db_conn() as conn:
         with conn.cursor() as cur:
             # 文字分段
             for doc in splitter.split_documents(loader.load()):
-                if doc.page_content.strip():
-                    insert_pdf_text(cur, doc.page_content.strip(), filename)
+                content = (doc.page_content or "").strip()
+                if content:
+                    insert_pdf_text(cur, content, filename, upload_file_id)
 
             # 圖片 OCR
             for p in range(len(pdf_doc)):
                 for xref, *_ in pdf_doc[p].get_images(full=True):
                     img_bytes = pdf_doc.extract_image(xref)["image"]
                     ocr_text  = pytesseract.image_to_string(
-                        Image.open(BytesIO(img_bytes)),
-                        lang="chi_tra+eng"
+                        Image.open(BytesIO(img_bytes)), lang="chi_tra+eng"
                     ).strip()
                     save_image_and_insert(cur, img_bytes, ocr_text,
-                                          'ocr_image', filename, page_num=p+1)
+                                          'ocr_image', filename, upload_file_id, page_num=p+1)
         conn.commit()
+    return upload_file_id
 
-# ---------- 圖片上傳處理 ----------------------------------------------------
+# ---------- 圖片上傳處理（含 MD5 冪等） ------------------------------------
 async def process_photo(img_bytes, original_name):
+    img_md5 = md5_bytes(img_bytes)
+    upload_file_id = get_or_create_upload_file_by_md5(original_name, "image", img_md5)
+
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM documents WHERE upload_file_id=%s LIMIT 1", (upload_file_id,))
+        if cur.fetchone():
+            return upload_file_id
+
     ocr_text = pytesseract.image_to_string(
-        Image.open(BytesIO(img_bytes)),
-        lang="chi_tra+eng"
+        Image.open(BytesIO(img_bytes)), lang="chi_tra+eng"
     ).strip()
+
     with db_conn() as conn:
         with conn.cursor() as cur:
             save_image_and_insert(cur, img_bytes, ocr_text,
-                                  'uploaded_image', original_name)
+                                  'uploaded_image', original_name, upload_file_id)
         conn.commit()
+    return upload_file_id
 
-# ---------- 不確定性偵測（關鍵新增） ----------------------------------------
-def is_uncertain(text: str) -> bool:
-    if not text:
-        return True
-    t = text.strip().lower()
-    # 常見不確定回覆關鍵詞（中英）
-    cues = [
-        "我不知道", "不清楚", "無法回答", "無從判斷", "需要更多資訊",
-        "找不到足夠", "沒有足夠依據", "資訊不足", "無足夠依據",
-        "unable to answer", "not sure", "insufficient", "need more information"
-    ]
-    # 任一關鍵詞命中即視為不確定
-    if any(c.lower() in t for c in cues):
-        return True
-    # 若看起來只有很短的一句否定，也視為不確定
-    if len(t) <= 20 and ("不知道" in t or "不清楚" in t):
-        return True
-    return False
-
-# ---------- 文字問答 / 修改（不確定時不顯示來源、不傳圖片） -------------------
-async def qa_or_modify(user_msg: str, send_text, send_photo):
+# ---------- 文字問答（強制 ID: 查詢） --------------------------------------
+async def qa_with_file_scope(fid: int, user_query: str, send_text):
     await send_text("請稍等，正在查詢資料中...")
-    # 1) 判斷是否為「修改」指令
-    sys_prompt = f"""
-你是一個幫助使用者修改資料庫內容的助手。
-請判斷以下訊息是否要修改資料：
-「{user_msg}」
-若需修改，回傳：
-{{"action":"modify","old_text":"...","new_text":"..."}}
-否則回傳：{{"action":"none"}}
-"""
-    try:
-        j = json.loads(llm.invoke([{"role":"system","content":sys_prompt}]).content)
-        if j.get("action") == "modify":
-            old_vec_str = vector_to_str(embedding_model.embed_query(j["old_text"]))
-            with db_conn() as conn, conn.cursor() as cur:
-                cur.execute("SELECT id FROM documents ORDER BY embedding <-> %s LIMIT 1",
-                            (old_vec_str,))
-                row = cur.fetchone()
-                if row:
-                    new_vec_str = vector_to_str(embedding_model.embed_query(j["new_text"]))
-                    cur.execute("""UPDATE documents
-                                   SET content=%s, embedding=%s
-                                   WHERE id=%s""",
-                                (j["new_text"], new_vec_str, row[0]))
-                    conn.commit()
-                    await send_text(f"✅ 已將「{j['old_text']}」更新為「{j['new_text']}」")
-                    return
-            await send_text("找不到要修改的內容，請確認原始內容是否存在")
-            return
-    except Exception as e:
-        print("判斷修改語句失敗：", e)
 
-    # 2) 問答流程
-    vec = embedding_model.embed_query(user_msg)
-    vec_str = vector_to_str(vec)
-    
-    # 2a) 取前 3 筆相似內容組成 context（含來源資訊）
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT content, filename, page_num, source_type
-            FROM documents
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding <-> %s
-            LIMIT 3
-        """, (vec_str,))
-        top = cur.fetchall()
+    rows = search_by_file_id(fid, user_query, k=8)
+    context, messages, sources = build_rag_prompt(user_query, rows)
 
-    context_parts = []
-    sources = []
-    for content, filename, page_num, source_type in top:
-        if content:
-            context_parts.append(content)
-            src = f"{filename}"
-            if page_num: src += f" p.{page_num}"
-            if source_type: src += f" ({source_type})"
-            sources.append(src)
-
-    context = "\n".join(context_parts)
-
-    # 嚴格只用 Context 回答；若 context 為空，直接回不知道（且不顯示來源，不傳圖片）
     if not context.strip():
         await send_text("我不知道。需要更多資訊。")
-        return
-
-    answer = llm.invoke([
-        {"role": "system", "content": STRICT_SYS_PROMPT},
-        {"role": "system", "content": f"Context:\n{context}"},
-        {"role": "user",   "content": user_msg}
-    ]).content
-
-    # 依不確定性決定是否附上資料來源，以及是否傳圖片
-    uncertain = is_uncertain(answer)
-
-    if not uncertain and sources:
-        answer += "\n\n📖 資料來源:\n" + "\n".join(f"- {s}" for s in sources)
-
-    await send_text(answer)
-
-    # 2b) 只有「確定」時才嘗試回傳圖片（不含任何文字）
-    if uncertain:
+        await send_text(list_files_text())  # 回清單形成循環
         return
 
     try:
-        with db_conn() as conn, conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT image_ref, (embedding <=> %s) AS dist
-                FROM documents
-                WHERE image_ref IS NOT NULL
-                  AND embedding IS NOT NULL
-                ORDER BY dist ASC
-                LIMIT {IMG_TOPK}
-            """, (vec_str,))
-            imgs = cur.fetchall()
-
-        for image_ref, dist in imgs:
-            if image_ref and dist is not None and dist <= IMG_SIM_THRESHOLD:
-                img_path = os.path.join(IMAGE_DIR, image_ref)
-                if os.path.exists(img_path):
-                    await send_photo(img_path)   # ← 不傳 caption，只傳圖片
-                    break  # 只回第一張達標圖
+        resp = llm.invoke(messages)
+        answer = resp.content if hasattr(resp, "content") else str(resp)
     except Exception as e:
-        print("回傳圖片流程錯誤：", e)
+        answer = f"產生答案時發生錯誤：{e}"
+
+    await send_text(answer)
+    await send_text(list_files_text())      # 回清單形成循環
 
 # ---------- Telegram Handler ----------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    if not msg: return
-
-    if msg.text and msg.text.strip() == "/start":
-        await msg.reply_text("初始化完成，可以開始使用")
+    if not msg:
         return
 
-    # 小幫手：送圖（確保檔案關閉；不帶 caption）
+    # /start 或 /files：列清單
+    if msg.text and msg.text.strip() in ("/start", "/files"):
+        await msg.reply_text(list_files_text())
+        return
+
+    # 小幫手：送出照片（必要時用；目前回答不自動回圖）
     async def _send_photo(path):
         try:
             with open(path, "rb") as f:
@@ -264,8 +284,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         await tg_file.download_to_drive(tmp.name)
         tmp.close()
-        await process_pdf(tmp.name)
-        await msg.reply_text("✅ PDF 已儲存並處理")
+        fid = await process_pdf(tmp.name)
+        await msg.reply_text(f"✅ PDF 已儲存並處理（檔案 ID：{fid}）\n\n" + list_files_text())
         return
 
     # ---------- Photo ----------
@@ -274,16 +294,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bio = BytesIO()
         await tg_file.download_to_memory(out=bio)
         img_bytes = bio.getvalue()
-        await process_photo(img_bytes, f"{msg.photo[-1].file_id}.jpg")
-        await msg.reply_text("✅ 圖片已處理並寫入資料庫")
+        fid = await process_photo(img_bytes, f"{msg.photo[-1].file_id}.jpg")
+        await msg.reply_text(f"✅ 圖片已處理並寫入資料庫（檔案 ID：{fid}）\n\n" + list_files_text())
         return
 
     # ---------- Text ----------
     if msg.text:
-        await qa_or_modify(msg.text.strip(), msg.reply_text, _send_photo)
+        text = msg.text.strip()
+        m = ID_QUERY_RE.match(text)
+        if not m:
+            await msg.reply_text(
+                "請以『ID: 問題』格式查詢，例如：\n\n"
+                "`12: 請幫我摘要這份手冊的安全注意事項`\n\n" +
+                list_files_text()
+            )
+            return
+        fid = int(m.group(1))
+        q = m.group(2).strip()
+        await qa_with_file_scope(fid, q, msg.reply_text)
         return
 
 # ---------- Bot 啟動 -------------------------------------------------------
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(MessageHandler(filters.ALL, handle_message))
-app.run_polling()
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", handle_message))
+    app.add_handler(CommandHandler("files", handle_message))
+    app.add_handler(MessageHandler(filters.ALL, handle_message))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
