@@ -84,6 +84,10 @@ indexes:
 | file_type    | text           | 檔案類型（如 `pdf`, `jpg`, `txt`） |
 | upload_time  | timestamp      | 上傳時間，預設為 CURRENT_TIMESTAMP |
 
+indexes:
+- `upload_files_pkey` (PK)
+- `ux_upload_files_file_md5` (UNIQUE, file_md5)
+
 ### 2. 資料庫內容轉移方法
 #### 方法一：使用 `pg_dump` 匯出 + `psql` 匯入
 
