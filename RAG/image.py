@@ -1,69 +1,24 @@
 import streamlit as st
 import psycopg2, os, uuid, datetime, hashlib
-import os
-import fitz  # 用於 PDF 圖片提取
+import fitz  # PDF 圖片提取
 from PIL import Image, ImageOps
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings
 from transformers import CLIPProcessor, CLIPModel
-import hashlib
 import pytesseract
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from io import BytesIO
 
-seen_hashes = set()
+# =========================
+# 初始化
+# =========================
 load_dotenv()
 
-# =========================
-# 公用工具（旋轉 / 鏡像 / 儲存 / EXIF）
-# =========================
-def load_image_for_preview(path: str) -> Image.Image:
-    """載入圖片並依 EXIF 自動糾正方向（僅顯示/後續再旋轉）。"""
-    img = Image.open(path)
-    img = ImageOps.exif_transpose(img)  # 把 EXIF 方向轉為像素層
-    return img
-
-def rotate_pil(img: Image.Image, deg: int) -> Image.Image:
-    """順時針旋轉 deg 度，expand=True 以免裁切。"""
-    if deg % 360 == 0:
-        return img
-    return img.rotate(-deg, expand=True)  # PIL rotate 是逆時針，取負數表示順時針
-
-def flip_pil(img: Image.Image, flip_h: bool, flip_v: bool) -> Image.Image:
-    """水平/垂直鏡像翻轉。"""
-    if flip_h:
-        img = ImageOps.mirror(img)
-    if flip_v:
-        img = ImageOps.flip(img)
-    return img
-
-def save_image_overwrite(path: str, img: Image.Image) -> str:
-    """覆寫存檔且移除 EXIF，回傳新檔 MD5。"""
-    buf = BytesIO()
-    fmt = "PNG" if path.lower().endswith(".png") else "JPEG"
-    img.save(buf, format=fmt, quality=95)
-    data = buf.getvalue()
-    with open(path, "wb") as f:
-        f.write(data)
-    return hashlib.md5(data).hexdigest()
-
-# =========================
-# 初始化資料夾與模型
-# =========================
 IMAGE_FOLDER = "image_dir"
-FILE_FOLDER = "uploaded_files"
+FILE_FOLDER  = "uploaded_files"
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
-os.makedirs(FILE_FOLDER, exist_ok=True)
-
-embedding_model = OpenAIEmbeddings(
-    model="text-embedding-3-small",
-    api_key=os.environ["OPENAI_API_KEY"]
-)
-
-# 初始化模型（如不用可移除）
-processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+os.makedirs(FILE_FOLDER,  exist_ok=True)
 
 PG_CONF = {
     "host": os.environ.get("PG_HOST"),
@@ -73,8 +28,76 @@ PG_CONF = {
     "password": os.environ.get("PG_PASSWORD")
 }
 
+# 依你的 DB 向量維度設定；請與 documents.embedding 的 vector 維度一致
+embedding_model = OpenAIEmbeddings(
+    model="text-embedding-3-large",
+    api_key=os.environ["OPENAI_API_KEY"]
+)
+
+# （可選）CLIP，可移除
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+
 conn = psycopg2.connect(**PG_CONF)
-cur = conn.cursor()
+cur  = conn.cursor()
+
+# =========================
+# 公用工具（旋轉 / 鏡像 / 儲存 / EXIF）
+# =========================
+def load_image_for_preview(path: str) -> Image.Image:
+    img = Image.open(path)
+    return ImageOps.exif_transpose(img)
+
+def rotate_pil(img: Image.Image, deg: int) -> Image.Image:
+    if deg % 360 == 0:
+        return img
+    return img.rotate(-deg, expand=True)  # PIL 正角度=逆時針，所以取負數
+
+def flip_pil(img: Image.Image, flip_h: bool, flip_v: bool) -> Image.Image:
+    if flip_h:
+        img = ImageOps.mirror(img)
+    if flip_v:
+        img = ImageOps.flip(img)
+    return img
+
+def save_image_overwrite(path: str, img: Image.Image) -> str:
+    buf = BytesIO()
+    fmt = "PNG" if path.lower().endswith(".png") else "JPEG"
+    img.save(buf, format=fmt, quality=95)
+    data = buf.getvalue()
+    with open(path, "wb") as f:
+        f.write(data)
+    return hashlib.md5(data).hexdigest()
+
+def md5_bytes(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest()
+
+# =========================
+# DB 小工具（冪等：以 MD5 取得或建立 upload_file）
+# =========================
+def get_or_create_upload_file_by_md5(file_name: str, file_type: str, file_md5: str) -> int:
+    """
+    以 file_md5 做唯一鍵。若已存在則回傳原 id；否則建立新列並回傳。
+    需要 DB 先建立唯一索引：
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_upload_files_file_md5 ON upload_files(file_md5);
+    """
+    cur.execute("SELECT id FROM upload_files WHERE file_md5=%s", (file_md5,))
+    row = cur.fetchone()
+    if row:
+        return row[0]
+    cur.execute("""
+        INSERT INTO upload_files (file_name, file_type, file_md5)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (file_md5)
+        DO UPDATE SET file_name = EXCLUDED.file_name
+        RETURNING id
+    """, (file_name, file_type, file_md5))
+    fid = cur.fetchone()[0]
+    conn.commit()
+    return fid
+
+def vector_str(vec) -> str:
+    return "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
 
 # =========================
 # Streamlit UI
@@ -83,7 +106,7 @@ st.set_page_config(page_title="向量資料管理系統", layout="wide")
 st.title("📁 向量資料管理系統")
 
 # -------------------------
-# 批量上傳圖片
+# 批量上傳圖片（以內容 MD5 去重）
 # -------------------------
 st.header("📤 批量上傳圖片")
 imgs = st.file_uploader("選擇圖片（可複選）", type=["png", "jpg", "jpeg"],
@@ -92,17 +115,26 @@ imgs = st.file_uploader("選擇圖片（可複選）", type=["png", "jpg", "jpeg
 for up in imgs:
     with st.spinner(f"處理圖片：{up.name}"):
         raw      = up.getbuffer()
-        img_hash = hashlib.md5(raw).hexdigest()
-        cur.execute("SELECT 1 FROM documents WHERE image_hash=%s", (img_hash,))
+        file_md5 = md5_bytes(raw)                 # 用於 upload_files 去重
+        img_md5  = file_md5                       # 圖片本體的雜湊
+
+        # 取得或建立 upload_file_id（冪等）
+        file_type = (up.type.split("/")[-1] if up.type else "").lower() or up.name.split(".")[-1].lower()
+        upload_file_id = get_or_create_upload_file_by_md5(up.name, file_type, file_md5)
+
+        # 若這個 ID 已處理過（documents 有資料），則直接略過重複寫入
+        cur.execute("SELECT 1 FROM documents WHERE upload_file_id=%s LIMIT 1", (upload_file_id,))
         if cur.fetchone():
-            st.info(f"⚠️ {up.name} 已存在（內容相同），跳過")
+            st.info(f"⚠️ {up.name} 先前已處理（ID {upload_file_id}），不重複寫入")
             continue
 
+        # 儲存圖片檔
         unique_ref = f"{uuid.uuid4().hex}_{up.name}"
         save_path  = os.path.join(IMAGE_FOLDER, unique_ref)
         with open(save_path, "wb") as f:
             f.write(raw)
 
+        # OCR
         try:
             text = pytesseract.image_to_string(Image.open(save_path),
                                                lang="chi_tra+eng").strip()
@@ -110,23 +142,27 @@ for up in imgs:
             st.error(f"OCR 失敗：{e}")
             text = ""
 
-        vector_str = None
+        # 向量（若有文字）
+        vec_str = None
         if text:
-            vec        = embedding_model.embed_query(text)
-            vector_str = "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
+            vec_str = "[" + ",".join(f"{v:.8f}" for v in embedding_model.embed_query(text)) + "]"
 
+        # 寫入 documents
         cur.execute("""
-            INSERT INTO documents (content, embedding, source_type,
-                                   image_ref, filename, image_desc,
-                                   image_hash, upload_time, page_num)
-            VALUES (%s,%s,'uploaded_image',%s,%s,NULL,%s,%s,NULL)
-        """, (text or None, vector_str, unique_ref, up.name,
-              img_hash, datetime.datetime.utcnow()))
+            INSERT INTO documents (
+                content, embedding, source_type,
+                image_ref, filename, image_desc,
+                image_hash, upload_time, page_num,
+                upload_file_id
+            )
+            VALUES (%s,%s,'uploaded_image',%s,%s,NULL,%s,%s,NULL,%s)
+        """, (text or None, vec_str, unique_ref, up.name,
+              img_md5, datetime.datetime.utcnow(), upload_file_id))
         conn.commit()
-        st.success(f"✅ 已上傳 {up.name}")
+        st.success(f"✅ 已上傳 {up.name}（檔案 ID: {upload_file_id}）")
 
 # -------------------------
-# 批量上傳文件（PDF/TXT）
+# 批量上傳文件（PDF/TXT，以內容 MD5 去重）
 # -------------------------
 st.header("📤 批量上傳文件（PDF/TXT）")
 docs = st.file_uploader("選擇文件（可複選）", type=["pdf", "txt"],
@@ -134,11 +170,24 @@ docs = st.file_uploader("選擇文件（可複選）", type=["pdf", "txt"],
 
 for df in docs:
     with st.spinner(f"處理文件：{df.name}"):
+        # 先把整份檔案寫到暫存路徑取得 bytes 以計算 MD5
         doc_path = os.path.join(FILE_FOLDER, df.name)
+        raw = df.getbuffer()
         with open(doc_path, "wb") as f:
-            f.write(df.getbuffer())
+            f.write(raw)
+        file_md5 = md5_bytes(raw)  # 用於 upload_files 冪等
 
-        loader = PyPDFLoader(doc_path) if df.name.endswith(".pdf") else TextLoader(doc_path)
+        file_type = df.name.split(".")[-1].lower()
+        upload_file_id = get_or_create_upload_file_by_md5(df.name, file_type, file_md5)
+
+        # 若此 ID 已有 documents，視為處理過，直接略過切塊與寫入
+        cur.execute("SELECT 1 FROM documents WHERE upload_file_id=%s LIMIT 1", (upload_file_id,))
+        if cur.fetchone():
+            st.info(f"⚠️ {df.name} 先前已處理（ID {upload_file_id}），不重複寫入")
+            continue
+
+        # 文字切塊
+        loader   = PyPDFLoader(doc_path) if df.name.endswith(".pdf") else TextLoader(doc_path)
         raw_docs = loader.load()
         splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
 
@@ -146,21 +195,27 @@ for df in docs:
             content = doc.page_content.strip()
             if not content:
                 continue
-            vec = embedding_model.embed_query(content)
-            vec_str = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+            vec_str = "[" + ",".join(f"{x:.8f}" for x in embedding_model.embed_query(content)) + "]"
             cur.execute("""
-                INSERT INTO documents (content, embedding, source_type,
-                                       filename, page_num)
-                VALUES (%s,%s,'pdf_text',%s,NULL)
-            """, (content, vec_str, df.name))
+                INSERT INTO documents (
+                    content, embedding, source_type,
+                    filename, page_num, upload_file_id, upload_time
+                )
+                VALUES (%s,%s,'pdf_text',%s,NULL,%s,%s)
+            """, (content, vec_str, df.name, upload_file_id, datetime.datetime.utcnow()))
 
+        # 若是 PDF，擷取內嵌圖片 → OCR → 寫入 documents（同一 upload_file_id）
         if df.name.endswith(".pdf"):
             pdf_doc = fitz.open(doc_path)
             for p in range(len(pdf_doc)):
-                for xref, *_ in pdf_doc[p].get_images(full=True):
-                    img_bytes = pdf_doc.extract_image(xref)["image"]
-                    h = hashlib.md5(img_bytes).hexdigest()
-                    cur.execute("SELECT 1 FROM documents WHERE image_hash=%s", (h,))
+                for img in pdf_doc[p].get_images(full=True):
+                    xref = img[0]
+                    extracted = pdf_doc.extract_image(xref)
+                    img_bytes = extracted["image"]
+                    img_md5   = md5_bytes(img_bytes)
+
+                    # 圖片內容去重
+                    cur.execute("SELECT 1 FROM documents WHERE image_hash=%s", (img_md5,))
                     if cur.fetchone():
                         continue
 
@@ -169,55 +224,75 @@ for df in docs:
                     with open(save_as, "wb") as f:
                         f.write(img_bytes)
 
-                    txt = pytesseract.image_to_string(Image.open(save_as),
-                                                      lang="chi_tra+eng").strip()
+                    try:
+                        txt = pytesseract.image_to_string(Image.open(save_as),
+                                                          lang="chi_tra+eng").strip()
+                    except Exception as e:
+                        st.error(f"OCR 失敗：{e}")
+                        txt = ""
+
                     vec_s = None
                     if txt:
-                        vec   = embedding_model.embed_query(txt)
-                        vec_s = "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
+                        vec_s = "[" + ",".join(f"{v:.8f}" for v in embedding_model.embed_query(txt)) + "]"
 
                     cur.execute("""
-                        INSERT INTO documents (content, embedding, source_type,
-                                               filename, page_num,
-                                               image_ref, image_desc,
-                                               image_hash, upload_time)
-                        VALUES (%s,%s,'ocr_image',%s,%s,%s,NULL,%s,%s)
+                        INSERT INTO documents (
+                            content, embedding, source_type,
+                            filename, page_num,
+                            image_ref, image_desc,
+                            image_hash, upload_time,
+                            upload_file_id
+                        )
+                        VALUES (%s,%s,'ocr_image',%s,%s,%s,NULL,%s,%s,%s)
                     """, (txt or None, vec_s, df.name, p+1, img_name,
-                          h, datetime.datetime.utcnow()))
+                          img_md5, datetime.datetime.utcnow(), upload_file_id))
         conn.commit()
-        st.success(f"✅ 已處理 {df.name}")
+        st.success(f"✅ 已處理 {df.name}（檔案 ID: {upload_file_id}）")
 
 # -------------------------
-# 文件管理與刪除
+# 文件管理與刪除（以 upload_files 為主）
 # -------------------------
 st.header("🗃️ 文件管理與刪除")
 
-cur.execute("""SELECT DISTINCT filename FROM documents WHERE filename IS NOT NULL AND source_type IN ('pdf_text', 'ocr_image')
+cur.execute("""
+    SELECT id, file_name, file_type, to_char(COALESCE(upload_time, NOW()), 'YYYY-MM-DD HH24:MI')
+    FROM upload_files
+    ORDER BY id DESC
 """)
-doc_files = sorted([row[0] for row in cur.fetchall() if row[0]])
+uf_rows   = cur.fetchall()
+uf_labels = [f"{r[0]} | {r[1]} ({r[2]}) @ {r[3]}" for r in uf_rows]
+uf_id_map = {lab: rid for lab, (rid, *_rest) in zip(uf_labels, uf_rows)}
 
-if doc_files:
-    doc_to_delete = st.selectbox("選擇要刪除的檔案（PDF/TXT/來自 Telegram）", doc_files)
-    if st.button(f"🗑 刪除文件 - {doc_to_delete}"):
+if uf_labels:
+    sel = st.selectbox("選擇要刪除的『檔案 ID』", uf_labels)
+    if st.button("🗑 刪除此檔案（含其所有切塊與圖片）"):
         try:
-            file_path = os.path.join(FILE_FOLDER, doc_to_delete)
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            sel_id = uf_id_map[sel]
 
-            cur.execute("SELECT image_ref FROM documents WHERE filename = %s AND image_ref IS NOT NULL", (doc_to_delete,))
-            image_refs = [row[0] for row in cur.fetchall()]
-            for image_ref in image_refs:
-                img_path = os.path.join(IMAGE_FOLDER, image_ref)
-                if os.path.exists(img_path):
-                    os.remove(img_path)
+            # 刪除原始檔（若存在）
+            cur.execute("SELECT file_name FROM upload_files WHERE id=%s", (sel_id,))
+            r = cur.fetchone()
+            if r:
+                fp = os.path.join(FILE_FOLDER, r[0])
+                if os.path.exists(fp):
+                    os.remove(fp)
 
-            cur.execute("DELETE FROM documents WHERE filename = %s", (doc_to_delete,))
+            # 刪掉 documents 圖片檔
+            cur.execute("SELECT image_ref FROM documents WHERE upload_file_id=%s AND image_ref IS NOT NULL", (sel_id,))
+            for (ir,) in cur.fetchall():
+                ip = os.path.join(IMAGE_FOLDER, ir)
+                if os.path.exists(ip):
+                    os.remove(ip)
+
+            # 刪記錄
+            cur.execute("DELETE FROM documents   WHERE upload_file_id=%s", (sel_id,))
+            cur.execute("DELETE FROM upload_files WHERE id=%s", (sel_id,))
             conn.commit()
-            st.warning(f"❌ 已刪除文件 {doc_to_delete}、相關圖片與向量紀錄，請重新整理")
+            st.warning(f"❌ 已刪除『檔案 ID {sel_id}』及其所有相關資料，請重新整理")
         except Exception as e:
             st.error(f"刪除失敗：{e}")
 else:
-    st.info("目前沒有可刪除的文件。")
+    st.info("目前沒有可刪除的檔案。")
 
 # -------------------------
 # 圖片註解與管理（含旋轉/鏡像/覆寫）
@@ -249,44 +324,44 @@ if file_sel:
         st.session_state["flips"] = {}
 
     for i, (ir, desc, pg) in enumerate(rows):
+        if not ir:
+            continue
         img_path = os.path.join(IMAGE_FOLDER, ir)
         if not os.path.exists(img_path):
             continue
 
-        row_id = f"{i}_{ir}"
+        row_id  = f"{i}_{ir}"
         key_rot = f"rot_{row_id}"
-        key_flip = f"flip_{row_id}"
+        key_flip= f"flip_{row_id}"
 
-        if key_rot not in st.session_state["rotations"]:
-            st.session_state["rotations"][key_rot] = 0
-        if key_flip not in st.session_state["flips"]:
-            st.session_state["flips"][key_flip] = {"h": False, "v": False}
+        st.session_state["rotations"].setdefault(key_rot, 0)
+        st.session_state["flips"].setdefault(key_flip, {"h": False, "v": False})
 
         col1, col2, col3 = st.columns([1.2, 2.2, 1.2])
 
         with col1:
-            base_img = load_image_for_preview(img_path)
-            preview_img = rotate_pil(base_img, st.session_state["rotations"][key_rot])
-            preview_img = flip_pil(preview_img,
-                                   st.session_state["flips"][key_flip]["h"],
-                                   st.session_state["flips"][key_flip]["v"])
+            base_img   = load_image_for_preview(img_path)
+            preview_img= rotate_pil(base_img, st.session_state["rotations"][key_rot])
+            preview_img= flip_pil(preview_img,
+                                  st.session_state["flips"][key_flip]["h"],
+                                  st.session_state["flips"][key_flip]["v"])
             st.image(preview_img, width=220, caption=f"{ir}" + (f"（頁 {pg}）" if pg else ""))
 
             c1, c2, c3, c4, c5, c6 = st.columns(6)
             with c1:
-                if st.button("↺ 90°", key=f"rotl_{row_id}"):
+                if st.button("↺ 90°",   key=f"rotl_{row_id}"):
                     st.session_state["rotations"][key_rot] = (st.session_state["rotations"][key_rot] + 90) % 360
                     st.rerun()
             with c2:
-                if st.button("↻ 270°", key=f"rotr_{row_id}"):
+                if st.button("↻ 270°",  key=f"rotr_{row_id}"):
                     st.session_state["rotations"][key_rot] = (st.session_state["rotations"][key_rot] + 270) % 360
                     st.rerun()
             with c3:
-                if st.button("180°", key=f"rot180_{row_id}"):
+                if st.button("180°",    key=f"rot180_{row_id}"):
                     st.session_state["rotations"][key_rot] = (st.session_state["rotations"][key_rot] + 180) % 360
                     st.rerun()
             with c4:
-                if st.button("重設", key=f"rot0_{row_id}"):
+                if st.button("重設",     key=f"rot0_{row_id}"):
                     st.session_state["rotations"][key_rot] = 0
                     st.session_state["flips"][key_flip] = {"h": False, "v": False}
                     st.rerun()
@@ -304,8 +379,7 @@ if file_sel:
             if st.button("💾 只存描述/向量", key=f"sdesc_{row_id}"):
                 vec_s = None
                 if new_desc.strip():
-                    vec   = embedding_model.embed_query(new_desc.strip())
-                    vec_s = "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
+                    vec_s = "[" + ",".join(f"{v:.8f}" for v in embedding_model.embed_query(new_desc.strip())) + "]"
                 cur.execute("""
                     UPDATE documents
                     SET image_desc=%s, embedding=%s
@@ -325,8 +399,7 @@ if file_sel:
 
                     vec_s = None
                     if new_desc.strip():
-                        vec   = embedding_model.embed_query(new_desc.strip())
-                        vec_s = "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
+                        vec_s = "[" + ",".join(f"{v:.8f}" for v in embedding_model.embed_query(new_desc.strip())) + "]"
                     cur.execute("""
                         UPDATE documents
                         SET image_desc=%s, embedding=%s
