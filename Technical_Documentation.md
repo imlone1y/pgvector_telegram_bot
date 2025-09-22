@@ -71,6 +71,7 @@ Once modified successfully, the agent will confirm by replying with the updated 
 | source_type   | text           | Source type (`ocr_image`, `uploaded_image`, `pdf_text`, etc.) |
 | image_hash    | varchar        | MD5 hash of image content (used to detect duplicates) |
 | upload_time   | timestamp      | Actual upload timestamp when record was inserted |
+| upload_file_id| integer        | seperate files                                |
 
 #### Table: `upload_files`
 
@@ -80,6 +81,11 @@ Once modified successfully, the agent will confirm by replying with the updated 
 | file_name     | text           | Uploaded file name               |
 | file_type     | text           | File type (`pdf`, `jpg`, `txt`)  |
 | upload_time   | timestamp      | Upload time, default: CURRENT_TIMESTAMP |
+| file_md5      | varchar        | context only one (MD5)           |
+
+indexes:
+- `upload_files_pkey (PK)` (PK)
+- `ux_upload_files_file_md5` (UNIQUE, file_md5)
 
 ---
 
