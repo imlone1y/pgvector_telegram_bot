@@ -83,6 +83,7 @@ indexes:
 | file_name    | text           | 上傳檔案的檔名               |
 | file_type    | text           | 檔案類型（如 `pdf`, `jpg`, `txt`） |
 | upload_time  | timestamp      | 上傳時間，預設為 CURRENT_TIMESTAMP |
+| file_code    | integer        | 序列編號                    |
 
 indexes:
 - `upload_files_pkey` (PK)
